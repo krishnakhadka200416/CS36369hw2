@@ -32,7 +32,18 @@ class ACTrainer:
             self.update_actor_net()
             # TODO: Calculate avg reward for this rollout
             # HINT: Add all the rewards from each trajectory. There should be "ntr" trajectories within a single rollout.
-            avg_ro_reward = ???
+            reward_total = 0
+            ntr = self.params["n_trajectory_per_rollout"]
+
+            for t in range(ntr):
+                trajectory_reward = sum(trajectory["reward"][t])
+#                 print("trajectory_reward: ", trajectory_reward)
+                reward_total += trajectory_reward
+#                 for r in trajectory["reward"]:
+#                     reward_total = reward_total + sum(r)
+                
+
+            avg_ro_reward = reward_total / ntr 
             print(f'End of rollout {ro_idx}: Average trajectory reward is {avg_ro_reward: 0.2f}')
             # Append average rollout reward into a list
             list_ro_reward.append(avg_ro_reward)
