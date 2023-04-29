@@ -65,18 +65,42 @@ class ACTrainer:
                 self.critic_optimizer.step()
                 self.critic_optimizer.zero_grad()
 
+
     def update_target_value(self, gamma=0.99):
         # TODO: Update target values
-        # HINT: Use definition of target-estimate from equation 7 of teh assignment PDF
+        # HINT: Use definition of target-estimate from equation 7 of the assignment PDF
+        n = len(self.trajectory['reward'])
+        
+        self.trajectory['state_value'] = [self.critic_net.predict(s) for s in self.trajectory['state']]
 
-        self.trajectory['state_value'] = ???
-        self.trajectory['target_value'] = ???
+        self.trajectory['target_value'] = []
+        for t in range(n):
+            if t == n - 1:
+                target_value = self.trajectory['reward'][t]
+            else:
+                target_value = self.trajectory['reward'][t] + gamma * self.trajectory['state_value'][t + 1]
+            self.trajectory['target_value'].append(target_value)
+
+        
 
     def estimate_advantage(self, gamma=0.99):
         # TODO: Estimate advantage
         # HINT: Use definition of advantage-estimate from equation 6 of teh assignment PDF
+        rewards = self.trajectory['reward']
+        state_values = self.trajectory['state_value']
 
-        self.trajectory['advantage'] = ???
+        n_steps = len(rewards)
+        advantages = torch.zeros_like(rewards)
+
+        for t in range(n_steps):
+            future_returns = 0
+            for k in range(t, n_steps):
+                future_returns += gamma**(k-t) * rewards[k]
+            advantages[t] = future_returns - state_values[t]
+
+        self.trajectory['advantage'] = advantages
+       
+        
 
     def update_actor_net(self):
         actor_loss = self.estimate_actor_loss_function()
@@ -87,16 +111,23 @@ class ACTrainer:
     def estimate_critic_loss_function(self):
         # TODO: Compute critic loss function
         # HINT: Use definition of critic-loss from equation 7 of teh assignment PDF. It is the MSE between target-values and state-values.
-        critic_loss = ???
+        target_values = self.trajectory['target_value']
+        state_values = self.trajectory['state_value']
+        critic_loss = torch.mean((target_values - state_values) ** 2)
         return critic_loss
+
 
     def estimate_actor_loss_function(self):
         actor_loss = list()
         for t_idx in range(self.params['n_trajectory_per_rollout']):
             advantage = apply_discount(self.trajectory['advantage'][t_idx])
             # TODO: Compute actor loss function
-        actor_loss = ???
+            policy = self.trajectory['policy'][t_idx]
+            actor_loss_t = -torch.log(policy) * advantage
+            actor_loss.append(actor_loss_t)
         return actor_loss
+    
+
 
     def generate_video(self, max_frame=1000):
         self.env = gym.make(self.params['env_name'], render_mode='rgb_array_list')
@@ -115,28 +146,38 @@ class ActorNet(nn.Module):
         super(ActorNet, self).__init__()
         # TODO: Define the actor net
         # HINT: You can use nn.Sequential to set up a 2 layer feedforward neural network.
-        self.ff_net = ???
+        self.ff_net = nn.Sequential(
+            nn.Linear(input_size, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_size)
+        )
 
     def forward(self, obs):
         # TODO: Forward pass of actor net
         # HINT: (use Categorical from torch.distributions to draw samples and log-prob from model output)
-        action_index = ???
-        log_prob = ???
+        logits = self.ff_net(obs)
+        dist = Categorical(logits=logits)
+        action_index = dist.sample()
+        log_prob = dist.log_prob(action_index)
         return action_index, log_prob
 
 
-# CLass for actor-net
+# CLass for CriticNet
 class CriticNet(nn.Module):
     def __init__(self, input_size, output_size, hidden_dim):
         super(CriticNet, self).__init__()
         # TODO: Define the critic net
         # HINT: You can use nn.Sequential to set up a 2 layer feedforward neural network.
-        self.ff_net = ???
+        self.ff_net = nn.Sequential(
+            nn.Linear(input_size, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_size)
+        )
 
     def forward(self, obs):
         # TODO: Forward pass of critic net
         # HINT: (get state value from the network using the current observation)
-        state_value = ???
+        state_value = self.ff_net(obs)
         return state_value
 
 
@@ -225,7 +266,15 @@ class DQNTrainer:
         # TODO: Implement the epsilon-greedy behavior
         # HINT: The agent will will choose action based on maximum Q-value with
         # '1-ε' probability, and a random action with 'ε' probability.
-        action = ???
+        if np.random.rand() < self.params['epsilon']:
+            # Random action
+            action = np.random.randint(self.params['action_space'])
+        else:
+            # Choose action based on maximum Q-value
+            state = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                q_values = self.q_net(state)
+            action = torch.argmax(q_values).item()
         return action
 
     def update_q_net(self):
@@ -235,8 +284,23 @@ class DQNTrainer:
         # HINT: You should draw a batch of random samples from the replay buffer
         # and train your Q-net with that sampled batch.
 
-        predicted_state_value = ???
-        target_value = ???
+        batch = self.replay_memory.sample(self.params['batch_size'])
+        states, actions, rewards, next_states, dones = zip(*batch)
+
+        states = torch.tensor(states, dtype=torch.float32).to(self.device)
+        actions = torch.tensor(actions, dtype=torch.long).to(self.device).unsqueeze(1)
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+        next_states = torch.tensor(next_states, dtype=torch.float32).to(self.device)
+        dones = torch.tensor(dones, dtype=torch.float32).to(self.device)
+
+        # Predicted state values
+        predicted_state_value = self.q_net(states).gather(1, actions)
+
+        # Target values computation
+        with torch.no_grad():
+            next_state_values = self.target_net(next_states).max(1)[0]
+            target_value = rewards + self.params['gamma'] * next_state_values * (1 - dones)
+
 
         criterion = nn.SmoothL1Loss()
         q_loss = criterion(predicted_state_value, target_value.unsqueeze(1))
@@ -269,13 +333,13 @@ class ReplayMemory:
     # TODO: Implement replay buffer
     # HINT: You can use python data structure deque to construct a replay buffer
     def __init__(self, capacity):
-        ???
+        self.buffer = deque(maxlen = capacity)
 
     def push(self, *args):
-        ???
+        self.buffer.append(args)
 
     def sample(self, n_samples):
-        ???
+        return random.samples(self.buffer, n_samples)
 
 
 class QNet(nn.Module):
@@ -283,7 +347,11 @@ class QNet(nn.Module):
     # This is identical to policy network from HW1
     def __init__(self, input_size, output_size, hidden_dim):
         super(QNet, self).__init__()
-        self.ff_net = ???
+        self.ff_net = nn.Sequential(
+            nn.Linear(input_size, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_size)
+        )
 
     def forward(self, obs):
         return self.ff_net(obs)
