@@ -21,6 +21,7 @@ def apply_discount(raw_reward, gamma=0.99):
     # HINT: Reverse the input list, keep a running-average. Reverse again to get the correct order.
     discounted_rtg_reward = []
     s = 0
+    # import pdb; pdb.set_trace();
     for i in reversed(raw_reward):
         s = i + gamma * s
         discounted_rtg_reward.append(s)

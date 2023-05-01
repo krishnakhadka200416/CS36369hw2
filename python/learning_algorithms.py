@@ -9,7 +9,11 @@ from torch import nn
 from torch.optim import Adam
 from torch.distributions import Categorical
 from utils import *
+import torch.nn.functional as F
 
+
+import torch.nn.utils.rnn as rnn_utils
+torch.autograd.set_detect_anomaly(True)
 
 # Class for training an RL agent with Actor-Critic
 class ACTrainer:
@@ -24,107 +28,109 @@ class ACTrainer:
         self.trajectory = None
 
     def run_training_loop(self):
-        list_ro_reward = list()
+        list_ro_reward = []
         for ro_idx in range(self.params['n_rollout']):
             self.trajectory = self.agent.collect_trajectory(policy=self.actor_net)
             self.update_critic_net()
             self.estimate_advantage()
             self.update_actor_net()
-            # TODO: Calculate avg reward for this rollout
-            # HINT: Add all the rewards from each trajectory. There should be "ntr" trajectories within a single rollout.
-            reward_total = 0
-            ntr = self.params["n_trajectory_per_rollout"]
 
-            for t in range(ntr):
-                trajectory_reward = sum(trajectory["reward"][t])
-#                 print("trajectory_reward: ", trajectory_reward)
-                reward_total += trajectory_reward
-#                 for r in trajectory["reward"]:
-#                     reward_total = reward_total + sum(r)
-                
+            # Calculate average reward for this rollout
+            rewards_per_trajectory = [sum(self.trajectory['reward'][t]) for t in range(self.params['n_trajectory_per_rollout'])]
+            avg_ro_reward = sum(rewards_per_trajectory) / self.params['n_trajectory_per_rollout']
 
-            avg_ro_reward = reward_total / ntr 
             print(f'End of rollout {ro_idx}: Average trajectory reward is {avg_ro_reward: 0.2f}')
+
             # Append average rollout reward into a list
             list_ro_reward.append(avg_ro_reward)
+
         # Save avg-rewards as pickle files
         pkl_file_name = self.params['exp_name'] + '.pkl'
         with open(pkl_file_name, 'wb') as f:
             pickle.dump(list_ro_reward, f)
+
         # Save a video of the trained agent playing
         self.generate_video()
+
         # Close environment
         self.env.close()
+
+
 
     def update_critic_net(self):
         for critic_iter_idx in range(self.params['n_critic_iter']):
             self.update_target_value()
             for critic_epoch_idx in range(self.params['n_critic_epoch']):
                 critic_loss = self.estimate_critic_loss_function()
-                critic_loss.backward()
+                critic_loss.backward(retain_graph=True)
                 self.critic_optimizer.step()
                 self.critic_optimizer.zero_grad()
 
 
     def update_target_value(self, gamma=0.99):
-        # TODO: Update target values
-        # HINT: Use definition of target-estimate from equation 7 of the assignment PDF
-        n = len(self.trajectory['reward'])
-        
-        self.trajectory['state_value'] = [self.critic_net.predict(s) for s in self.trajectory['state']]
+        observations = self.trajectory['obs']
+        path_rewards = self.trajectory['reward']
+        path_tgt_values = []
+        for idx, obs in enumerate(observations):
+            rewards_list = path_rewards[idx]
+            rewards_arr = np.array(rewards_list, dtype=np.float32).reshape(-1, 1)
+            next_states = np.vstack((obs[1:], np.zeros((1, obs.shape[1]))))
+            next_state_vals_arr = self.critic_net(torch.tensor(next_states, dtype=torch.float32)).detach().numpy()
+            tgt_vals_arr = rewards_arr + gamma * next_state_vals_arr
+            path_tgt_values.append(torch.tensor(tgt_vals_arr, dtype=torch.float32))
 
-        self.trajectory['target_value'] = []
-        for t in range(n):
-            if t == n - 1:
-                target_value = self.trajectory['reward'][t]
-            else:
-                target_value = self.trajectory['reward'][t] + gamma * self.trajectory['state_value'][t + 1]
-            self.trajectory['target_value'].append(target_value)
+        self.trajectory['target_value'] = path_tgt_values
 
         
 
     def estimate_advantage(self, gamma=0.99):
         # TODO: Estimate advantage
         # HINT: Use definition of advantage-estimate from equation 6 of teh assignment PDF
-        rewards = self.trajectory['reward']
-        state_values = self.trajectory['state_value']
+        observations = self.trajectory['obs']
+        self.update_target_value()
+        path_state_vals = [self.critic_net(obs) for obs in observations]
+        self.trajectory['state_value'] = path_state_vals
+        state_vals = self.trajectory['state_value']
+        tgt_vals = self.trajectory['target_value']
+        advantage_vals = []
 
-        n_steps = len(rewards)
-        advantages = torch.zeros_like(rewards)
+        for state_vals_idx, tgt_vals_idx in zip(state_vals, tgt_vals):
+            adv_vals_idx = tgt_vals_idx - state_vals_idx
+            advantage_vals.append(adv_vals_idx.detach())
+        self.trajectory['advantage'] = advantage_vals
 
-        for t in range(n_steps):
-            future_returns = 0
-            for k in range(t, n_steps):
-                future_returns += gamma**(k-t) * rewards[k]
-            advantages[t] = future_returns - state_values[t]
-
-        self.trajectory['advantage'] = advantages
-       
-        
 
     def update_actor_net(self):
         actor_loss = self.estimate_actor_loss_function()
         actor_loss.backward()
         self.actor_optimizer.step()
-        self.actor_optimizer.zero_grad()
+        self.actor_optimizer.zero_grad() 
+
 
     def estimate_critic_loss_function(self):
-        # TODO: Compute critic loss function
-        # HINT: Use definition of critic-loss from equation 7 of teh assignment PDF. It is the MSE between target-values and state-values.
-        target_values = self.trajectory['target_value']
-        state_values = self.trajectory['state_value']
+        obs = self.trajectory['obs']
+        traj_states = []
+        for t_idx in range(len(obs)):
+            traj_states.append(self.critic_net(obs[t_idx]))
+        self.trajectory['state_value'] = traj_states
+        target_values = torch.cat(self.trajectory['target_value'])
+        state_values = torch.cat(self.trajectory['state_value'])
         critic_loss = torch.mean((target_values - state_values) ** 2)
         return critic_loss
 
 
+
     def estimate_actor_loss_function(self):
         actor_loss = list()
+        log_probs_list = self.trajectory['log_prob']
         for t_idx in range(self.params['n_trajectory_per_rollout']):
-            advantage = apply_discount(self.trajectory['advantage'][t_idx])
+            log_probs_list_idx = log_probs_list[t_idx]
+            discounted_advantage = apply_discount([t.item() for t in self.trajectory['advantage'][t_idx]])
             # TODO: Compute actor loss function
-            policy = self.trajectory['policy'][t_idx]
-            actor_loss_t = -torch.log(policy) * advantage
-            actor_loss.append(actor_loss_t)
+            loss_value = sum(log_prob * adv_val for log_prob, adv_val in zip(log_probs_list_idx, discounted_advantage))
+            actor_loss.append(-loss_value)
+
+        actor_loss = torch.stack(actor_loss).mean()
         return actor_loss
     
 
@@ -148,8 +154,11 @@ class ActorNet(nn.Module):
         # HINT: You can use nn.Sequential to set up a 2 layer feedforward neural network.
         self.ff_net = nn.Sequential(
             nn.Linear(input_size, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_size)
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, output_size),
+            nn.Softmax(dim = -1)
         )
 
     def forward(self, obs):
@@ -170,7 +179,9 @@ class CriticNet(nn.Module):
         # HINT: You can use nn.Sequential to set up a 2 layer feedforward neural network.
         self.ff_net = nn.Sequential(
             nn.Linear(input_size, hidden_dim),
-            nn.ReLU(),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
             nn.Linear(hidden_dim, output_size)
         )
 
@@ -187,6 +198,8 @@ class ACAgent:
         self.env = env
         self.params = params
         self.action_space = [action for action in range(self.env.action_space.n)]
+
+
 
     def collect_trajectory(self, policy):
         obs, _ = self.env.reset(seed=self.params['rng_seed'])
@@ -266,14 +279,14 @@ class DQNTrainer:
         # TODO: Implement the epsilon-greedy behavior
         # HINT: The agent will will choose action based on maximum Q-value with
         # '1-ε' probability, and a random action with 'ε' probability.
-        if np.random.rand() < self.params['epsilon']:
-            # Random action
-            action = np.random.randint(self.params['action_space'])
+        if np.random.random() < self.epsilon:
+            # With ε probability, choose a random action
+            action = self.env.action_space.sample()
         else:
-            # Choose action based on maximum Q-value
-            state = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+            # With 1-ε probability, choose the action with the highest Q-value
+            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(get_device())
             with torch.no_grad():
-                q_values = self.q_net(state)
+                q_values = self.q_net(obs_tensor)
             action = torch.argmax(q_values).item()
         return action
 
@@ -283,27 +296,42 @@ class DQNTrainer:
         # TODO: Update Q-net
         # HINT: You should draw a batch of random samples from the replay buffer
         # and train your Q-net with that sampled batch.
+          # Sample a batch of experiences from the replay buffer
+        # states, actions, rewards, next_states, not_terminals = self.replay_memory.sample(self.params['batch_size'])
 
-        batch = self.replay_memory.sample(self.params['batch_size'])
-        states, actions, rewards, next_states, dones = zip(*batch)
+        # states = torch.tensor(np.array(states), dtype=torch.float32).to(get_device())
+        # actions = torch.tensor(actions, dtype=torch.long).unsqueeze(1).to(get_device())
+        # rewards = torch.tensor(rewards, dtype=torch.float32).to(get_device())
+        # next_states = [state for state in next_states if state is not None]
+        # not_terminals = torch.tensor(not_terminals, dtype=torch.bool).to(get_device())
 
-        states = torch.tensor(states, dtype=torch.float32).to(self.device)
-        actions = torch.tensor(actions, dtype=torch.long).to(self.device).unsqueeze(1)
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
-        next_states = torch.tensor(next_states, dtype=torch.float32).to(self.device)
-        dones = torch.tensor(dones, dtype=torch.float32).to(self.device)
+        # predicted_state_value = self.q_net(states).gather(1, actions)
 
-        # Predicted state values
-        predicted_state_value = self.q_net(states).gather(1, actions)
+        # # Compute target Q-values for the next states
+        # with torch.no_grad():
+        #     next_state_values = torch.zeros(self.params['batch_size'], device=get_device())
+        #     next_state_values[not_terminals] = self.target_net(torch.tensor(np.array(next_states), dtype=torch.float32).to(get_device())).max(1)[0].detach()
+        #     target_value = rewards + self.params['gamma'] * next_state_values
+        
+        s, a, r, ns, not_term = self.replay_memory.sample(self.params['batch_size'])
+        s = torch.tensor(np.array(s), dtype=torch.float32).to(get_device())
+        a = torch.tensor(a, dtype=torch.long).unsqueeze(1).to(get_device())
+        r = torch.tensor(r, dtype=torch.float32).to(get_device())
+        not_term = torch.tensor(not_term, dtype=torch.bool).to(get_device())
 
-        # Target values computation
+        # Calculate the predicted state values for the current states and actions using the Q-network
+        q_vals = self.q_net(s)
+        predicted_s_val = q_vals.gather(1, a)
+
+        # Compute target Q-values for the next states
         with torch.no_grad():
-            next_state_values = self.target_net(next_states).max(1)[0]
-            target_value = rewards + self.params['gamma'] * next_state_values * (1 - dones)
+            ns = torch.tensor(np.array([state for state in ns if state is not None]), dtype=torch.float32).to(get_device())
+            next_q_vals = torch.zeros(self.params['batch_size'], device=get_device())
+            next_q_vals[not_term] = self.target_net(ns).max(1)[0].detach()
+            tgt_val = r + self.params['gamma'] * next_q_vals
 
-
-        criterion = nn.SmoothL1Loss()
-        q_loss = criterion(predicted_state_value, target_value.unsqueeze(1))
+        # Calculate the Q-network loss
+        q_loss = nn.SmoothL1Loss()(predicted_s_val, tgt_val.unsqueeze(1))
         self.optimizer.zero_grad()
         q_loss.backward()
         self.optimizer.step()
@@ -333,13 +361,17 @@ class ReplayMemory:
     # TODO: Implement replay buffer
     # HINT: You can use python data structure deque to construct a replay buffer
     def __init__(self, capacity):
-        self.buffer = deque(maxlen = capacity)
+        self.capacity = capacity
+        self.buffer = deque(maxlen=capacity)
 
     def push(self, *args):
         self.buffer.append(args)
 
     def sample(self, n_samples):
-        return random.samples(self.buffer, n_samples)
+        samples = random.sample(self.buffer, n_samples)
+        states, actions, rewards, next_states, not_terminals = zip(*samples)
+        return states, actions, rewards, next_states, not_terminals
+
 
 
 class QNet(nn.Module):
@@ -349,7 +381,9 @@ class QNet(nn.Module):
         super(QNet, self).__init__()
         self.ff_net = nn.Sequential(
             nn.Linear(input_size, hidden_dim),
-            nn.ReLU(),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
             nn.Linear(hidden_dim, output_size)
         )
 
